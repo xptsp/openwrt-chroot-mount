@@ -1,0 +1,2 @@
+#!/bin/bash
+/etc/init.d/chroot_mount chroot_hotplug

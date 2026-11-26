@@ -1,0 +1,176 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+
+USE_PROCD=1
+
+extra_command "chroot_worker" "Internal background worker loop"
+extra_command "chroot_hotplug" "Hotplug worker"
+
+# Callback function to harvest all global parameters cleanly from UCI
+_parse_global_section() {
+	local cfg="$1"
+	local t_dir a_mnt b_umnt
+	
+	config_get t_dir "$cfg" target_dir ""
+	config_get a_mnt "$cfg" after_mount ""
+	config_get b_umnt "$cfg" before_umount ""
+	
+	[ -n "$t_dir" ] && TARGET_DIR_TMP="$t_dir"
+	[ -n "$a_mnt" ] && GLOBAL_AFTER_MOUNT_TMP="$a_mnt"
+	[ -n "$b_umnt" ] && GLOBAL_BEFORE_UMOUNT_TMP="$b_umnt"
+}
+
+chroot_hotplug() {
+	. /lib/functions.sh
+	config_load chroot_mount
+
+	local TARGET_DIR=""
+	local GLOBAL_AFTER_MOUNT=""
+	
+	# Parse global configuration values via loop callback
+	config_foreach _parse_global_section global
+	TARGET_DIR="$TARGET_DIR_TMP"
+
+	# Only run if the chroot is currently mounted
+	if mountpoint -q "${TARGET_DIR}"; then
+		case "$ACTION" in
+		    add|remove)
+		        # Small delay so partitions/filesystems settle on slow USB drives
+		        sleep 1
+		        chroot "${TARGET_DIR}" /bin/sh -c '
+		            mkdir -p /dev/disk/by-uuid
+		            rm -f /dev/disk/by-uuid/*
+		            for dev in $(blkid -c /dev/null -o device); do
+		                uuid=$(blkid -c /dev/null -s UUID -o value "$dev")
+		                [ -n "$uuid" ] && ln -sf "$dev" "/dev/disk/by-uuid/$uuid"
+		            done
+		        ' >/dev/null 2>&1
+		        ;;
+		esac
+	fi
+}
+
+chroot_worker() {
+	. /lib/functions.sh
+	config_load chroot_mount
+
+	local TARGET_DIR=""
+	local GLOBAL_AFTER_MOUNT=""
+	
+	# Parse global configuration values via loop callback
+	local TARGET_DIR_TMP="" GLOBAL_AFTER_MOUNT_TMP="" GLOBAL_BEFORE_UMOUNT_TMP=""
+	config_foreach _parse_global_section global
+	TARGET_DIR="$TARGET_DIR_TMP"
+	GLOBAL_AFTER_MOUNT="$GLOBAL_AFTER_MOUNT_TMP"
+
+	[ -z "$TARGET_DIR" ] && TARGET_DIR="$CHROOT_TARGET_DIR"
+
+	if [ -z "$TARGET_DIR" ]; then
+		echo "chroot_mount error: target_dir not configured." >&2
+		exit 1
+	fi
+
+	# Mount Individual Physical Devices with localized hooks
+	mount_physical_device() {
+		local cfg="$1"
+		local device target options mount_flags before_mount after_mount
+
+		config_get device "$cfg" device ""
+		config_get target "$cfg" target ""
+		config_get options "$cfg" options ""
+		config_get before_mount "$cfg" before_mount ""
+		config_get after_mount "$cfg" after_mount ""
+
+		[ -z "$device" ] || [ -z "$target" ] && return
+
+		# Infinite loop: waits precisely until the block device exists
+		while [ ! -b "$device" ]; do
+			sleep 1
+		done
+
+		# Localized pre-mount hook
+		if [ -n "$before_mount" ]; then
+			eval "$before_mount"
+		fi
+
+		mkdir -p "$target"
+		[ -n "$options" ] && mount_flags="-o $options" || mount_flags=""
+
+		if ! mountpoint -q "$target"; then
+			mount $mount_flags "$device" "$target"
+		fi
+
+		# Localized post-mount hook
+		if [ -n "$after_mount" ] && mountpoint -q "$target"; then
+			eval "$after_mount"
+		fi
+	}
+	config_foreach mount_physical_device mount_root
+	config_foreach mount_physical_device mount_point
+
+	# Mount Virtual API Filesystems
+	mount --bind /proc "${TARGET_DIR}/proc"
+	mount --bind /sys "${TARGET_DIR}/sys"
+	mount -t sysfs /sys "${TARGET_DIR}/sys"
+	mount --rbind /dev "${TARGET_DIR}/dev"
+	mount --make-rslave "${TARGET_DIR}/dev"
+	mount -t devpts devpts "${TARGET_DIR}/dev/pts" -o rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000
+	mount -t tmpfs -o rw,nosuid,nodev tmpfs ${TARGET_DIR}/tmp
+	mount -t tmpfs tmpfs "${TARGET_DIR}/run"
+	mkdir -p "${TARGET_DIR}/tmp/shm"
+	chmod 1777 "${TARGET_DIR}/tmp/shm"
+
+	# Copy DNS Configuration
+	cp /tmp/resolv.conf.d/resolv.conf.auto "${TARGET_DIR}/etc/resolv.conf"
+
+	# Populate /dev/disk/by-uuid inside the chroot so Timeshift detects partitions properly
+	chroot_hotplug
+
+	# Run Global Post-Mount Hook if configured
+	if [ -n "$GLOBAL_AFTER_MOUNT" ]; then
+		( eval "$GLOBAL_AFTER_MOUNT" )
+	fi
+}
+
+start_service() {
+	config_load chroot_mount
+	
+	local TARGET_DIR_TMP="" GLOBAL_AFTER_MOUNT_TMP="" GLOBAL_BEFORE_UMOUNT_TMP=""
+	config_foreach _parse_global_section global
+	local target_dir="$TARGET_DIR_TMP"
+
+	if [ -z "$target_dir" ]; then
+		echo "ERROR: target_dir is not configured in /etc/config/chroot_mount" >&2
+		return 1
+	fi
+
+	procd_open_instance "worker"
+	procd_set_param command "$initscript" chroot_worker
+	procd_set_param env CHROOT_TARGET_DIR="$target_dir"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	config_load chroot_mount
+	
+	local TARGET_DIR_TMP="" GLOBAL_AFTER_MOUNT_TMP="" GLOBAL_BEFORE_UMOUNT_TMP=""
+	config_foreach _parse_global_section global
+	local TARGET_DIR="$TARGET_DIR_TMP"
+	local GLOBAL_BEFORE_UMOUNT="$GLOBAL_BEFORE_UMOUNT_TMP"
+
+	[ -z "$TARGET_DIR" ] && return 0
+
+	# Run Global Pre-Unmount Hook before shutting anything down
+	if [ -n "$GLOBAL_BEFORE_UMOUNT" ]; then
+		echo "Running global pre-unmount hook..."
+		( eval "$GLOBAL_BEFORE_UMOUNT" )
+	fi
+
+	# Unmount virtual/API systems first (reverse order)
+	echo "Unmounting chroot environment..."
+	mount | grep /chroot | tac | while read MISC1 MISC2 DIR MISC3; do umount -l ${DIR}; done
+}
