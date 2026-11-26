@@ -102,9 +102,8 @@ exists in your environment.
 
 ## Helper script
 
-`files/my-chroot.sh` contains example service actions for the hook commands:
+`sample-chroot-init.sh` contains example service actions for the hook commands:
 
-- `start-before`: stops `dockerd`.
 - `start-after`: starts `dockerd`, `media-downloader`, and `samba4`, then
   restarts `sshd`.
 - `stop-before`: stops `dockerd`, `media-downloader`, `samba4`, and `nfsd`,
